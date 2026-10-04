@@ -233,6 +233,10 @@ def read_upstreams():
         if base and keys:
             proto = src.get("protocol") or detect_protocol(base, keys[0])
             up = {"base_url": base, "keys": keys, "proxy": src.get("proxy"), "protocol": proto}
+            if src.get("slug"):
+                # 单一入口：这个上游的多个模型合成一个模型名（选择器里只出现一个），
+                # 具体用哪个由候选链决定。适合模型名带 "/" 的网关（Codex 选择器不显示带斜杠的）
+                up["slug"] = src["slug"]
             if src.get("models"):
                 up["models"] = list(src["models"])
             out[short] = up
@@ -275,14 +279,27 @@ def build_base_routes(upstreams):
             log(f"  {short:<10} 列出 {len(ids)} 个: {ids}")
         per[short] = ids
 
+    slug_ups = {s for s, u in upstreams.items() if u.get("slug")}
+
+    routes = {}
+    # 带 slug 的上游：所有模型合成一个入口，候选按配置顺序（第一个不行就下一个）
+    for short in UPSTREAM_ORDER:
+        up = upstreams.get(short, {})
+        if not up.get("slug"):
+            continue
+        cands = [{"upstream": short, "model": m} for m in per.get(short, [])]
+        if cands:
+            routes[up["slug"]] = {"candidates": cands}
+
+    # 其余上游：按模型名出条（同名跨网关自动合并）
     names = {}
     for short in UPSTREAM_ORDER:
+        if short in slug_ups:
+            continue
         for m in per.get(short, []):
             names.setdefault(m, [])
             if short not in names[m]:
                 names[m].append(short)
-
-    routes = {}
     for m, ups in names.items():
         ordered = sorted(ups, key=UPSTREAM_ORDER.index)
         routes[m] = {"candidates": [{"upstream": u, "model": m} for u in ordered]}
@@ -324,9 +341,10 @@ def finalize_routes(routes, per, verdicts):
             log(f"    - {u}/{m}  [{v}] {d}")
 
     # 同名模型强制指定上游的别名（自己排第一，其余作兜底）
+    # 单入口路由（如 nvidia）跳过：它里面本来就是同一上游的多个模型
     for slug in list(routes):
         cands = routes[slug]["candidates"]
-        if len(cands) > 1:
+        if len({c["upstream"] for c in cands}) > 1:
             for c in cands:
                 routes[f"{slug}-{c['upstream']}"] = {
                     "candidates": [c] + [x for x in cands if x is not c]}
