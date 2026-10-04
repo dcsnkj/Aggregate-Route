@@ -53,6 +53,9 @@ RETRYABLE_TEXT = ("get_channel_failed", "负载已经达到上限", "rate limit"
                   "额度不足", "余额不足", "insufficient", "quota", "balance", "暂时不可用",
                   "用户已被封禁", "无效的令牌")
 
+# Codex 认识的 Responses 终止事件（用它判断流是否完整结束）
+_TERMINAL_EVENTS = (b"response.completed", b"response.failed")
+
 STREAM_TIMEOUT = 180           # 单次 socket 读超时（秒）——上游长时间不说话就放弃
 DEFAULT_HEADER_TIMEOUT = 30    # 等响应头的上限；超了就当这个候选不行，换下一个
                                # （anyrouter 满载有时要 81 秒才回 500，靠这个跳走）
@@ -332,9 +335,9 @@ class Handler(BaseHTTPRequestHandler):
                         continue
                     _COOLDOWN.pop((up_short, key), None)     # 这个 key 是好的
                     if protocol_of(up) == "chat":
-                        self._stream_bridge(obj, tag, tried, t0, first, body)
+                        self._stream_bridge(obj, tag, tried, t0, first, body, up_short, key)
                     else:
-                        self._stream_back(obj, tag, tried, t0, first)
+                        self._stream_back(obj, tag, tried, t0, first, up_short, key)
                     return
 
                 if kind == "http":
@@ -389,7 +392,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {"error": {"message": txt[:500], "type": "upstream_error"}}
 
-    def _stream_bridge(self, resp, tag, tried, t0, first, body):
+    def _stream_bridge(self, resp, tag, tried, t0, first, body, up_short=None, key=None):
         """上游是 chat 协议：把它的 SSE 逐块翻成 Responses 事件再发给 Codex。"""
         from chat_bridge import ChatStreamBridge
         br = ChatStreamBridge(body.get("model") or "",
@@ -407,6 +410,7 @@ class Handler(BaseHTTPRequestHandler):
                 return b""
             payload = line[5:].strip()
             if payload == b"[DONE]":
+                done_flag[0] = True
                 return br.finish()
             try:
                 d = json.loads(payload)
@@ -414,6 +418,7 @@ class Handler(BaseHTTPRequestHandler):
                 return b""
             return br.feed(d)
 
+        done_flag = [False]
         total = 0
         try:
             out0 = br.start()
@@ -443,13 +448,18 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     buf += chunk
 
-            out = br.finish()
+            out = br.finish(truncated=not done_flag[0])
             self._chunk(out)
             self.wfile.flush()
             total += len(out)
+            if not done_flag[0]:
+                log("stream_truncated", via=tag, protocol="chat", bytes=total,
+                    reasoning_chars=br.reasoning_chars)
+                if up_short and key:
+                    self._cool(up_short, key, 504, "truncated")
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
-            log("ok", via=tag, protocol="chat", bytes=total,
+            log("ok", via=tag, protocol="chat", bytes=total, truncated=not done_flag[0],
                 elapsed=round(time.time() - t0, 1), finish=br.finish_reason,
                 reasoning_chars=br.reasoning_chars,
                 skipped=[t.get("cand") or t.get("upstream") for t in tried] or None)
@@ -464,7 +474,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _stream_back(self, resp, tag, tried, t0, first=b""):
+    def _stream_back(self, resp, tag, tried, t0, first=b"", up_short=None, key=None):
         ctype = resp.headers.get("content-type") or "text/event-stream"
         self.send_response(200)
         self.send_header("content-type", ctype)
@@ -472,9 +482,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("transfer-encoding", "chunked")
         self.end_headers()
         total = 0
+        terminal = False
+        tail = b""
         try:
             if first:
                 total += len(first)
+                tail = first[-4096:]
+                if any(k in tail for k in _TERMINAL_EVENTS):
+                    terminal = True
                 self._chunk(first)
                 self.wfile.flush()
             while True:
@@ -482,11 +497,32 @@ class Handler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 total += len(chunk)
+                tail = (tail + chunk)[-4096:]
+                if not terminal and any(k in tail for k in _TERMINAL_EVENTS):
+                    terminal = True
                 self._chunk(chunk)
                 self.wfile.flush()
+            if not terminal:
+                # 上游流在完成前断了。补一个 response.failed，
+                # 让 Codex 走它的重试逻辑，而不是把半截回答当完整回答。
+                trunc = b'event: response.failed\ndata: ' + json.dumps({
+                    "type": "response.failed",
+                    "response": {"status": "failed",
+                                 "error": {"code": "stream_truncated",
+                                           "message": "上游流在完成前中断（未见 response.completed）"}}},
+                    ensure_ascii=False).encode("utf-8") + b'\n\n'
+                self._chunk(trunc)
+                self.wfile.flush()
+                total += len(trunc)
+                log("stream_truncated", via=tag, bytes=total,
+                    elapsed=round(time.time() - t0, 1))
+                if up_short and key:
+                    # 冷置这把 key：Codex 重试时会换一把，而不是又撞同一个
+                    self._cool(up_short, key, 504, "truncated")
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
             log("ok", via=tag, bytes=total, elapsed=round(time.time() - t0, 1),
+                truncated=not terminal,
                 skipped=[t.get("cand") or t.get("upstream") for t in tried] or None)
         except (BrokenPipeError, ConnectionResetError):
             log("client_gone", via=tag, bytes=total)

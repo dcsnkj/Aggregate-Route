@@ -278,8 +278,13 @@ class ChatStreamBridge:
                                 delta=fn["arguments"])
         return out
 
-    def finish(self):
-        """收尾：补齐 done 事件 + response.completed。"""
+    def finish(self, truncated=False):
+        """收尾：补齐 done 事件 + 终止事件。
+
+        truncated=True 表示上游 chat 流**没送到结尾**（没有 [DONE]/finish_reason）——
+        这时要发 response.failed 而不是 response.completed，
+        否则 Codex 会把半截回答当成完整回答、回合就此结束（表现为"任务做到一半停了"）。
+        """
         out = b""
         for kind, key in self.order:
             if kind == "message":
@@ -315,9 +320,15 @@ class ChatStreamBridge:
             else:
                 st = self.tools[key]
                 output.append(dict(self._tool_item(st, "completed")))
-        out += self._ev("response.completed",
-                        response=self._response_obj("completed", output=output,
-                                                    completed=True))
+        if truncated:
+            obj = self._response_obj("failed", output=output, completed=True)
+            obj["error"] = {"code": "stream_truncated",
+                            "message": "上游流在完成前中断（没有 finish_reason/[DONE]）"}
+            out += self._ev("response.failed", response=obj)
+        else:
+            out += self._ev("response.completed",
+                            response=self._response_obj("completed", output=output,
+                                                        completed=True))
         return out
 
 
