@@ -449,6 +449,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             log("ok", via=tag, protocol="chat", bytes=total,
                 elapsed=round(time.time() - t0, 1), finish=br.finish_reason,
+                reasoning_chars=br.reasoning_chars,
                 skipped=[t.get("cand") or t.get("upstream") for t in tried] or None)
         except (BrokenPipeError, ConnectionResetError):
             log("client_gone", via=tag, protocol="chat", bytes=total)

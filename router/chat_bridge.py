@@ -167,6 +167,9 @@ class ChatStreamBridge:
         self.usage = None
         self.finish_reason = None
         self.started = False
+        # 思维链（非标字段 reasoning_content）会被丢弃：Codex 只认 output_text。
+        # 记数量方便排查"界面一直显示思考中" —— 那是模型在思考，不是卡死。
+        self.reasoning_chars = 0
 
     # ---- 内部 ----
     def _ev(self, etype, **kw):
@@ -235,6 +238,10 @@ class ChatStreamBridge:
         delta = ch.get("delta") or {}
         if ch.get("finish_reason"):
             self.finish_reason = ch["finish_reason"]
+
+        rc = delta.get("reasoning_content")
+        if rc:
+            self.reasoning_chars += len(rc)
 
         text = delta.get("content")
         if text:
