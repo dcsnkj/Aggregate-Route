@@ -106,6 +106,13 @@ def test(model, key, base):
                    {"anthropic-version": "2023-06-01",
                     "anthropic-beta": "context-1m-2025-08-07"})
     out["messages+1m"] = (c, brief(c, d), t)
+
+    # OpenAI 的 chat 协议：Codex 自己不用（只认 responses），
+    # 但网关只有 chat 时可以靠路由的桥接层翻译进来
+    cbody = {"model": model, "max_tokens": 512, "temperature": 0,
+             "messages": [{"role": "user", "content": "hi"}]}
+    c, d, t = call(base, "/chat/completions", cbody, key)
+    out["chat"] = (c, brief(c, d), t)
     return model, out
 
 
@@ -134,7 +141,7 @@ def main():
     with ThreadPoolExecutor(max_workers=6) as p:
         results = dict(p.map(lambda m: test(m, key, base), models))
 
-    protos = ["responses", "messages", "messages+1m"]
+    protos = ["responses", "chat", "messages", "messages+1m"]
     print(f"{'模型':<34} " + " ".join(f"{p:<14}" for p in protos))
     print("-" * 92)
     for m in models:

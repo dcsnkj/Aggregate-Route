@@ -76,7 +76,7 @@ SKIP_SUBSTR = ("-cc-format", "claude-", "gemini-", "image", "embedding", "rerank
 
 def load_sources(dry=False):
     """读 ~/.codex/router-sources.json；不存在就按模板生成一份（dry 模式只提示不写）。"""
-    global UPSTREAM_SOURCES, UPSTREAM_ORDER, AUTO_CHAIN
+    global UPSTREAM_SOURCES, UPSTREAM_ORDER, AUTO_CHAIN, PROVIDER_NAME
     if not SOURCES_FILE.exists():
         if dry:
             log(f"  [dry] 会生成上游来源模板: {SOURCES_FILE}")
@@ -89,6 +89,8 @@ def load_sources(dry=False):
             d = SOURCES_TEMPLATE
     else:
         d = json.loads(SOURCES_FILE.read_text(encoding="utf-8"))
+    if d.get("provider_name"):
+        PROVIDER_NAME = d["provider_name"]
     UPSTREAM_SOURCES = d.get("upstreams") or {}
     names = list(UPSTREAM_SOURCES)
     UPSTREAM_ORDER = d.get("order") or names
@@ -123,13 +125,72 @@ def read_extra_keys():
     return out
 
 
+def read_keys_file(path):
+    """读一行一把 key 的文本文件（# 注释）。key 形态不限于 sk-（有的网关用 nvapi- 等）。"""
+    p = Path(os.path.expandvars(os.path.expanduser(str(path))))
+    if not p.exists():
+        log(f"    !! keys_file 不存在: {p}")
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        s = line.strip().strip('"').strip("'")
+        if s and not s.startswith("#") and " " not in s and len(s) >= 16:
+            out.append(s)
+    return out
+
+
+def detect_protocol(base, key, timeout=15):
+    """探测网关是 responses 还是 chat 协议。
+
+    Codex **只认 responses**（`wire_api="chat"` 已被官方移除），
+    所以只有 chat 接口的网关必须靠桥接层翻译（见 router/chat_bridge.py）。
+    判据：POST <base>/responses，拿到 `404 page not found` 这种"根本没这个路由"的
+    响应就是 chat；返回 JSON 错误（400/404 模型不支持）说明端点存在。
+    """
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    body = json.dumps({"model": "probe", "input": "hi", "messages": [{"role": "user", "content": "hi"}]}).encode()
+    rq = urllib.request.Request(base.rstrip("/") + "/responses", data=body,
+                                headers={"authorization": "Bearer " + key,
+                                         "content-type": "application/json"}, method="POST")
+    try:
+        with op.open(rq, timeout=timeout) as r:
+            r.read(64)
+        return "responses"
+    except urllib.error.HTTPError as e:
+        txt = ""
+        try:
+            txt = e.read(200).decode("utf-8", "replace")
+        except Exception:
+            pass
+        if e.code == 404 and "page not found" in txt.lower():
+            return "chat"
+        return "responses"
+    except Exception:
+        return "responses"
+
+
 def read_upstreams():
-    """把同名站点的多把 key 合并成一个上游（keys 数组），供路由轮换。"""
+    """把同一个站点的多把 key 合并成一个上游（keys 数组），供路由轮换。"""
     db = sqlite3.connect(str(CC_DB))
     out = {}
     extra = read_extra_keys()
     for short, src in UPSTREAM_SOURCES.items():
         base, keys, sources = None, [], []
+
+        # A) 直接声明：base_url（+ 可选 keys_file / keys）
+        if src.get("base_url"):
+            base = str(src["base_url"]).rstrip("/")
+            for k in (src.get("keys") or []):
+                if k not in keys:
+                    keys.append(k)
+                    sources.append("sources 内联")
+            if src.get("keys_file"):
+                for k in read_keys_file(src["keys_file"]):
+                    if k not in keys:
+                        keys.append(k)
+                        sources.append(Path(str(src["keys_file"])).name)
+
+        # B) 从 cc-switch 收集
         for pname, sc in db.execute(
                 "SELECT name,settings_config FROM providers WHERE app_type='codex'"):
             if src.get("name_exact"):
@@ -138,7 +199,7 @@ def read_upstreams():
             elif src.get("name_match"):
                 if src["name_match"] not in pname.lower():
                     continue
-                if pname == PROVIDER_NAME:      # 别把路由自己收进来（名字里也含 anyrouter）
+                if pname == PROVIDER_NAME:      # 别把路由自己收进来（名字里也可能含匹配词）
                     continue
             else:
                 continue
@@ -167,8 +228,13 @@ def read_upstreams():
                     keys.append(k)
                     sources.append(f"{EXTRA_KEYS.name}（手动追加）")
         if base and keys:
-            out[short] = {"base_url": base, "keys": keys, "proxy": None}
-            log(f"  {short:<10} {base:<30} {len(keys)} 个 key：")
+            proto = src.get("protocol") or detect_protocol(base, keys[0])
+            up = {"base_url": base, "keys": keys, "proxy": src.get("proxy"), "protocol": proto}
+            if src.get("models"):
+                up["models"] = list(src["models"])
+            out[short] = up
+            ptag = "" if proto == "responses" else "  ⚠️ chat 协议（将经桥接层翻译）"
+            log(f"  {short:<10} {base:<30} {len(keys)} 个 key  协议={proto}{ptag}")
             for k, s in zip(keys, sources):
                 log(f"      …{k[-6:]:<8} 来自 {s}")
         else:
@@ -190,16 +256,21 @@ def fetch_models(up):
 
 
 def build_base_routes(upstreams):
-    """只按 /v1/models 生成「模型名 -> 候选上游」，还没校验、还没别名。"""
+    """生成「模型名 -> 候选上游」。有 models 白名单就用它，否则拉 /v1/models 全量。"""
     per = {}
     for short, up in upstreams.items():
-        try:
-            ids = [m for m in fetch_models(up) if not any(s in m.lower() for s in SKIP_SUBSTR)]
-        except Exception as e:
-            log(f"  !! {short} 拉模型列表失败: {type(e).__name__} {e}")
-            ids = []
+        allow = up.get("models") or []
+        if allow:
+            ids = list(allow)
+            log(f"  {short:<10} 用白名单里的 {len(ids)} 个: {ids}")
+        else:
+            try:
+                ids = [m for m in fetch_models(up) if not any(s in m.lower() for s in SKIP_SUBSTR)]
+            except Exception as e:
+                log(f"  !! {short} 拉模型列表失败: {type(e).__name__} {e}")
+                ids = []
+            log(f"  {short:<10} 列出 {len(ids)} 个: {ids}")
         per[short] = ids
-        log(f"  {short:<10} 列出 {len(ids)} 个: {ids}")
 
     names = {}
     for short in UPSTREAM_ORDER:
@@ -232,7 +303,7 @@ def finalize_routes(routes, per, verdicts):
             if v in HARD_DROP:
                 dropped.append((slug, c["upstream"], c["model"], detail))
                 continue
-            if v in ("nobalance", "overloaded", "timeout", "net", "other"):
+            if v in ("nobalance", "overloaded", "timeout", "net", "other", "empty"):
                 weak.append((slug, c["upstream"], c["model"], v, detail))
             alive.append(c)
         if alive:
@@ -322,10 +393,23 @@ def probe_one(up, model, timeout=12):
 def _probe_one_key(up, model, key, timeout):
     import queue as _q
     import threading as _t
-    body = dict(PROBE_BODY)
-    body["model"] = model
+    proto = up.get("protocol") or "responses"
+    if proto == "chat":
+        # chat 上游按非流式探测：一次性拿到完整回包，好看清 content 有没有出来
+        sys.path.insert(0, str(SRC_ROUTER_DIR))
+        from chat_bridge import responses_to_chat
+        probe = dict(PROBE_BODY)
+        probe["stream"] = False
+        probe.pop("include", None)
+        probe["model"] = model
+        body = responses_to_chat(probe)
+        path = "/chat/completions"
+    else:
+        body = dict(PROBE_BODY)
+        body["model"] = model
+        path = "/responses"
     rq = urllib.request.Request(
-        up["base_url"] + "/responses", data=json.dumps(body).encode("utf-8"),
+        up["base_url"] + path, data=json.dumps(body).encode("utf-8"),
         headers={"content-type": "application/json", "accept": "text/event-stream",
                  "authorization": "Bearer " + key,
                  "originator": "codex_exec", "user-agent": "codex_cli_rs/0.160.0"},
@@ -337,7 +421,10 @@ def _probe_one_key(up, model, key, timeout):
             op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             r = op.open(rq, timeout=60)
             code, txt = r.status, ""
-            if code != 200:
+            if code == 200 and proto == "chat":
+                # 200 也可能是"内容为空"（推理模型把额度花在思维链上）
+                txt = r.read(20000).decode("utf-8", "replace")
+            elif code != 200:
                 txt = r.read(300).decode("utf-8", "replace")
             r.close()
             res.put(("ok" if code == 200 else "http", code, txt))
@@ -352,6 +439,18 @@ def _probe_one_key(up, model, key, timeout):
     except _q.Empty:
         return "timeout", f">{timeout}s 无响应"
     if kind == "ok":
+        if proto == "chat":
+            # chat 上游：看 content / tool_calls 有没有真出来
+            try:
+                ch = (json.loads(b).get("choices") or [{}])[0]
+                msg = ch.get("message") or {}
+                if msg.get("content") or msg.get("tool_calls"):
+                    return "ok", "HTTP 200"
+                if msg.get("reasoning_content"):
+                    return "empty", "HTTP 200 但只回了思维链（推理模型，正式用要放宽 max_tokens）"
+                return "empty", f"HTTP 200 但内容为空 finish={ch.get('finish_reason')!r}"
+            except Exception:
+                return "empty", f"HTTP 200 但响应解析不出内容: {b[:60]}"
         return "ok", "HTTP 200"
     if kind == "net":
         return "net", f"{a}: {b[:80]}"
@@ -497,10 +596,10 @@ def install_launcher(dry, autostart):
     """
     ROUTER_DIR.mkdir(parents=True, exist_ok=True)
     if dry:
-        log(f"  [dry] 会安装 {ROUTER_DIR}/ 下的 codex_router.py / watchdog.py / ensure_router.py"
+        log(f"  [dry] 会安装 {ROUTER_DIR}/ 下的 codex_router.py / chat_bridge.py / watchdog.py / ensure_router.py"
             " 与 start.cmd" + ("，并放到开机启动" if autostart else ""))
         return
-    for fn in ("codex_router.py", "watchdog.py", "ensure_router.py"):
+    for fn in ("codex_router.py", "chat_bridge.py", "watchdog.py", "ensure_router.py"):
         shutil.copy2(SRC_ROUTER_DIR / fn, ROUTER_DIR / fn)
     cmd = ROUTER_DIR / "start.cmd"
     cmd.write_text(
@@ -531,6 +630,7 @@ def main():
     log("=== 0) 读取上游来源规则 ===")
     load_sources(dry=a.dry)
     log(f"  上游: {list(UPSTREAM_SOURCES)}   候选顺序: {UPSTREAM_ORDER}   兜底链: {AUTO_CHAIN}")
+    log(f"  provider 名: {PROVIDER_NAME}")
 
     log("\n=== 1) 读取各上游的地址与密钥 ===")
     upstreams = read_upstreams()
@@ -561,6 +661,7 @@ def main():
     for slug, r in routes.items():
         chain = " -> ".join(
             f"{x['upstream']}/{x['model']}"
+            + ("(chat)" if (upstreams.get(x["upstream"], {}).get("protocol") == "chat") else "")
             + ("" if x.get("probe") in (None, "ok") else f"[{x['probe']}]")
             for x in r["candidates"])
         mark = " " if slug in live else "×"

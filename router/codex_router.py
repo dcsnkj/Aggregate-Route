@@ -128,9 +128,27 @@ def opener_for(up):
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def protocol_of(up):
+    """上游协议：responses（默认，原样透传）或 chat（需要翻译层）。"""
+    return (up.get("protocol") or "responses").lower()
+
+
 def build_request(up, model, body, key):
-    payload = dict(body)
-    payload["model"] = model
+    """按上游协议造请求。
+
+    - responses：请求体原样转发到 <base>/responses
+    - chat：把 Responses 形状翻成 Chat 形状，打到 <base>/chat/completions
+      （Codex 只认 responses，但很多网关只有 chat —— 见 chat_bridge.py）
+    """
+    proto = protocol_of(up)
+    if proto == "chat":
+        from chat_bridge import responses_to_chat
+        payload = responses_to_chat(dict(body, model=model))
+        path = "/chat/completions"
+    else:
+        payload = dict(body)
+        payload["model"] = model
+        path = "/responses"
     headers = {
         "content-type": "application/json",
         "accept": "text/event-stream",
@@ -138,7 +156,7 @@ def build_request(up, model, body, key):
         "originator": "codex_exec",
         "user-agent": "codex_cli_rs/0.160.0 (Windows 10.0.19045; x86_64) codex_exec",
     }
-    url = up["base_url"].rstrip("/") + "/responses"
+    url = up["base_url"].rstrip("/") + path
     return urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                  headers=headers, method="POST")
 
@@ -224,7 +242,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "ok": True,
                 "routes": len(cfg.get("routes", {})),
-                "upstreams": {k: len(keys_of(v)) for k, v in cfg.get("upstreams", {}).items()},
+                "upstreams": {k: {"keys": len(keys_of(v)), "protocol": protocol_of(v)}
+                              for k, v in cfg.get("upstreams", {}).items()},
             })
             return
         if path.endswith("/models"):
@@ -310,7 +329,10 @@ class Handler(BaseHTTPRequestHandler):
                         self._cool(up_short, key, 200, head_txt)
                         continue
                     _COOLDOWN.pop((up_short, key), None)     # 这个 key 是好的
-                    self._stream_back(obj, tag, tried, t0, first)
+                    if protocol_of(up) == "chat":
+                        self._stream_bridge(obj, tag, tried, t0, first, body)
+                    else:
+                        self._stream_back(obj, tag, tried, t0, first)
                     return
 
                 if kind == "http":
@@ -364,6 +386,80 @@ class Handler(BaseHTTPRequestHandler):
             return json.loads(txt)
         except Exception:
             return {"error": {"message": txt[:500], "type": "upstream_error"}}
+
+    def _stream_bridge(self, resp, tag, tried, t0, first, body):
+        """上游是 chat 协议：把它的 SSE 逐块翻成 Responses 事件再发给 Codex。"""
+        from chat_bridge import ChatStreamBridge
+        br = ChatStreamBridge(body.get("model") or "",
+                              instructions=body.get("instructions"),
+                              parallel_tool_calls=bool(body.get("parallel_tool_calls", True)))
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("transfer-encoding", "chunked")
+        self.end_headers()
+
+        def feed_line(line):
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                return b""
+            payload = line[5:].strip()
+            if payload == b"[DONE]":
+                return br.finish()
+            try:
+                d = json.loads(payload)
+            except Exception:
+                return b""
+            return br.feed(d)
+
+        total = 0
+        try:
+            out0 = br.start()
+            self._chunk(out0)
+            self.wfile.flush()
+            total += len(out0)
+
+            buf = first or b""
+            done = False
+            while not done:
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    out = feed_line(line)
+                    if out:
+                        self._chunk(out)
+                        self.wfile.flush()
+                        total += len(out)
+                chunk = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
+                if not chunk:
+                    if buf.strip():
+                        out = feed_line(buf)
+                        if out:
+                            self._chunk(out)
+                            self.wfile.flush()
+                            total += len(out)
+                    done = True
+                else:
+                    buf += chunk
+
+            out = br.finish()
+            self._chunk(out)
+            self.wfile.flush()
+            total += len(out)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            log("ok", via=tag, protocol="chat", bytes=total,
+                elapsed=round(time.time() - t0, 1), finish=br.finish_reason,
+                skipped=[t.get("cand") or t.get("upstream") for t in tried] or None)
+        except (BrokenPipeError, ConnectionResetError):
+            log("client_gone", via=tag, protocol="chat", bytes=total)
+        except Exception as e:
+            log("stream_error", via=tag, protocol="chat",
+                error=f"{type(e).__name__}: {e}", bytes=total)
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
     def _stream_back(self, resp, tag, tried, t0, first=b""):
         ctype = resp.headers.get("content-type") or "text/event-stream"
@@ -442,8 +538,9 @@ def check(cfg):
                 if not good:
                     ok = False
                 head = f"{slug:<24} " if (i == 0 and j == 0) else " " * 25
+                ptag = "" if protocol_of(up) == "responses" else " (chat 桥接)"
                 print(f"{head}{cand['upstream']}/{cand['model']}@{short(key):<10} "
-                      f"{'OK  ' if good else '!!  '}HTTP {code} {txt}")
+                      f"{'OK  ' if good else '!!  '}HTTP {code} {txt}{ptag}")
     print()
     print("全部可用 ✅" if ok else "有候选不可用（上面带 !! 的）—— 可能是临时满载/欠费，稍后再试")
     return 0 if ok else 1
@@ -485,12 +582,14 @@ def doctor(cfg):
     for name, up in cfg.get("upstreams", {}).items():
         n = len(keys_of(up))
         exp = expected.get(name)
+        proto = protocol_of(up)
+        ptag = "" if proto == "responses" else f"[{proto} 桥接]"
         if exp and n < exp:
-            print(f"  上游 {name:<9} ⚠️ {n} 把 key（上次装配时是 {exp} 把，少了 {exp - n} 把）")
+            print(f"  上游 {name:<9} ⚠️ {n} 把 key（上次装配时是 {exp} 把，少了 {exp - n} 把）{ptag}")
             ok = False
         else:
             tail = f"（上次装配 {exp} 把）" if exp else ""
-            print(f"  上游 {name:<9} ✅ {n} 把 key {tail}")
+            print(f"  上游 {name:<9} ✅ {n} 把 key {tail}{ptag}")
 
     cat = CODEX_HOME / "codex-router-catalog.json"
     if cat.exists():

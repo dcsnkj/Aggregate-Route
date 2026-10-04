@@ -7,6 +7,7 @@
 
 所以它是幂等的：Codex 每次开会话都调一次，成本只有一次 0.2 秒的端口探测。
 """
+import json
 import socket
 import subprocess
 import sys
@@ -38,8 +39,9 @@ def log(msg):
         p = Path.home() / ".codex" / "logs" / "model-router.log"
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, "a", encoding="utf-8") as f:
-            f.write(f'{{"ts": "{time.strftime("%Y-%m-%d %H:%M:%S")}", '
-                    f'"event": "ensure", "msg": "{msg}"}}\n')
+            # 必须用 json.dumps：手拼 JSON 时 Windows 路径里的反斜杠会转义坏掉
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "event": "ensure", "msg": msg}, ensure_ascii=False) + "\n")
     except Exception:
         pass
 

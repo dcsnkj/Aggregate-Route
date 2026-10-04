@@ -9,6 +9,7 @@
 由 Startup 目录里的 `Codex模型路由.cmd` 在登录时启动，之后一直活着。
 成本：每 60 秒一次 socket 探测（0.2 秒），几乎为零。
 """
+import json
 import socket
 import subprocess
 import sys
@@ -46,8 +47,9 @@ def log(msg, event="watchdog"):
     try:
         LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG, "a", encoding="utf-8") as f:
-            f.write(f'{{"ts": "{time.strftime("%Y-%m-%d %H:%M:%S")}", '
-                    f'"event": "{event}", "msg": "{msg}"}}\n')
+            # 必须用 json.dumps：手拼 JSON 时 Windows 路径里的反斜杠会转义坏掉
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "event": event, "msg": msg}, ensure_ascii=False) + "\n")
     except Exception:
         pass
 

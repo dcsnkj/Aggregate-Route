@@ -15,6 +15,10 @@ Codex 只连一个本地地址，路由按**模型名**把请求转发到对应�
 ## 特性
 
 - **一个 provider 用遍所有网关**：Codex 只认 `http://127.0.0.1:8788/v1`，剩下的交给路由。
+- **chat 协议桥接**：Codex **只支持 Responses API**（`wire_api = "chat"` 已被官方移除），
+  而很多网关（如 NVIDIA NIM）只有 `/chat/completions`。
+  路由内置翻译层，把 Responses 请求/事件流与 Chat 的 messages/delta 流互转，
+  于是**只有 chat 的网关也能挂进来**（工具调用、图片输入都实测通过）。
 - **多 key 轮换 + 冷却**：每把 key 依次轮换起步；失败的那把临时冷置
   （额度不足 15 分钟 / 限流 2 分钟 / 5xx 与超时 1 分钟），正常的优先用，全冷置时仍逐个试。
 - **两级故障转移**：同一网关的下一把 key → 路由表里的下一个候选网关。
@@ -39,7 +43,8 @@ Codex 只连一个本地地址，路由按**模型名**把请求转发到对应�
                         ▼                       ▼                       ▼
                   ┌───────────┐          ┌───────────┐          ┌───────────┐
                   │ 网关 A    │          │ 网关 B    │          │ 网关 C    │
-                  │ key×N 轮换│          │ key×1     │          │ …          │
+                  │ responses │          │ responses │          │ chat 协议 │
+                  │ key×N 轮换│          │ key×1     │          │（桥接翻译）│
                   └───────────┘          └───────────┘          └───────────┘
 ```
 
@@ -75,6 +80,26 @@ cd Aggregate-Route
 | `extra_keys` | 额外把 `~/.codex/router-extra-keys.txt` 里的 key 也并进来 |
 | `order` | 同名模型跨网关时的候选顺序（靠前的优先） |
 | `auto_chain` | `auto` 这个兜底模型的尝试顺序 |
+| `provider_name` | 可选，覆盖在 cc-switch 里显示的名字 |
+
+网关不在 cc-switch 里时，可以**直接声明**：
+
+```json
+"nvidia": {
+  "base_url": "https://integrate.api.nvidia.com/v1",
+  "keys_file": "~/.codex/nvidia-keys.txt",
+  "models": ["nvidia/nemotron-3-ultra-550b-a55b"]
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `base_url` | 网关地址（带路径前缀） |
+| `keys_file` | 一行一把 key 的文本文件（`#` 注释） |
+| `models` | 只挑这些模型（不写就拉网关的 `/v1/models` 全量；
+  网关列表常混着大量无权限/已停用的模型，写白名单更省事） |
+
+> `protocol`（`responses` / `chat`）**不用手写** —— 装配时会自动探测并把该字段写进路由配置。
 
 **2. 装配**
 
@@ -125,6 +150,7 @@ python tools/capture_request.py &
 ```
 router/
   codex_router.py     路由本体：流式 SSE 透传、多 key 轮换、冷却、两级故障转移、热加载配置
+  chat_bridge.py      chat ↔ responses 协议桥：让只有 /chat/completions 的网关也能给 Codex 用
   watchdog.py         看门狗：每 60 秒探活，路由挂了自动拉回
   ensure_router.py    "确保在跑"：给会话启动钩子之类的一次性调用
 setup/
@@ -155,8 +181,11 @@ docs/
   路由本体是跨平台的，macOS/Linux 需要自己接一下自启。
 - `--doctor` 的 key 数量对比依赖装配时写入的 `expected_keys` 基线；
   手工改过路由配置后基线可能失真，重跑一次装配即可。
-- 网关的 `/v1/models` **不可信**：不同协议（`/responses` vs `/messages`）支持的模型完全不同，
-  用 `tools/probe_model_matrix.py` 实测为准。
+- 网关的 `/v1/models` **不可信**：不同协议（`/responses` / `/chat/completions` / `/messages`）
+  支持的模型完全不同，用 `tools/probe_model_matrix.py` 实测为准。
+- **Codex 只认 Responses 协议**。所以「网关能不能用」的第一道门槛是
+  `POST <base>/responses` 有没有这个端点：`200/400` 说明有，`404 page not found` 说明没有
+  （没有的走桥接层）。
 
 ## License
 
