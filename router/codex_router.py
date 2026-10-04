@@ -457,8 +457,11 @@ class Handler(BaseHTTPRequestHandler):
                     reasoning_chars=br.reasoning_chars)
                 if up_short and key:
                     self._cool(up_short, key, 504, "truncated")
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             log("ok", via=tag, protocol="chat", bytes=total, truncated=not done_flag[0],
                 elapsed=round(time.time() - t0, 1), finish=br.finish_reason,
                 reasoning_chars=br.reasoning_chars,
@@ -519,8 +522,11 @@ class Handler(BaseHTTPRequestHandler):
                 if up_short and key:
                     # 冷置这把 key：Codex 重试时会换一把，而不是又撞同一个
                     self._cool(up_short, key, 504, "truncated")
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass          # 客户端已经走了，但这条请求的结局仍要记下来
             log("ok", via=tag, bytes=total, elapsed=round(time.time() - t0, 1),
                 truncated=not terminal,
                 skipped=[t.get("cand") or t.get("upstream") for t in tried] or None)
