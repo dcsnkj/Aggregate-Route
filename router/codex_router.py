@@ -144,6 +144,8 @@ def build_request(up, model, body, key):
     if proto == "chat":
         from chat_bridge import responses_to_chat
         payload = responses_to_chat(dict(body, model=model))
+        # 上游级额外参数（如 {"reasoning_effort": "low"} 让推理模型别把时间花在思维链上）
+        payload.update(up.get("extra_body") or {})
         path = "/chat/completions"
     else:
         payload = dict(body)

@@ -233,6 +233,9 @@ def read_upstreams():
         if base and keys:
             proto = src.get("protocol") or detect_protocol(base, keys[0])
             up = {"base_url": base, "keys": keys, "proxy": src.get("proxy"), "protocol": proto}
+            if src.get("extra_body"):
+                # 额外请求体参数：原样并入 chat 请求（例如 {"reasoning_effort": "low"}）
+                up["extra_body"] = dict(src["extra_body"])
             if src.get("slug"):
                 # 单一入口：这个上游的多个模型合成一个模型名（选择器里只出现一个），
                 # 具体用哪个由候选链决定。适合模型名带 "/" 的网关（Codex 选择器不显示带斜杠的）
@@ -444,6 +447,7 @@ def _probe_one_key(up, model, key, timeout):
         probe.pop("include", None)
         probe["model"] = model
         body = responses_to_chat(probe)
+        body.update(up.get("extra_body") or {})
         path = "/chat/completions"
     else:
         body = dict(PROBE_BODY)
