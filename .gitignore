@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 本地运行产物
+tmp/
+*.log
+
+# 本地配置与密钥 —— 绝对不要提交
+codex-model-router.json
+codex-router-catalog.json
+router-sources.json
+router-extra-keys.txt
+hooks.json
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
