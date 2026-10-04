@@ -81,6 +81,14 @@ cd Aggregate-Route
 | `order` | 同名模型跨网关时的候选顺序（靠前的优先） |
 | `auto_chain` | `auto` 这个兜底模型的尝试顺序 |
 | `provider_name` | 可选，覆盖在 cc-switch 里显示的名字 |
+| `fallbacks` | 可选，**跨模型兜底**：某个模型的候选全挂了就换别家的别的模型顶上。
+
+```json
+"fallbacks": {
+  "gpt-6-astra": [["nvidia", "nvidia/nemotron-3-ultra-550b-a55b"],
+                  ["deepseek", "deepseek-flash"]]
+}
+```
 
 网关不在 cc-switch 里时，可以**直接声明**：
 

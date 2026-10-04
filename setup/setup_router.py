@@ -68,6 +68,7 @@ SOURCES_TEMPLATE = {
 }
 
 UPSTREAM_SOURCES = {}      # 由 load_sources() 填充
+FALLBACKS = {}             # 由 load_sources() 填充：模型 -> [[上游, 模型], ...] 跨模型兜底
 UPSTREAM_ORDER = []
 AUTO_CHAIN = []
 # 这些模型 Codex 的 responses 路径用不了，别放进目录（Claude 走 /v1/messages，图片模型也不是对话模型）
@@ -89,6 +90,8 @@ def load_sources(dry=False):
             d = SOURCES_TEMPLATE
     else:
         d = json.loads(SOURCES_FILE.read_text(encoding="utf-8"))
+    global FALLBACKS
+    FALLBACKS = d.get("fallbacks") or {}
     if d.get("provider_name"):
         PROVIDER_NAME = d["provider_name"]
     UPSTREAM_SOURCES = d.get("upstreams") or {}
@@ -341,6 +344,26 @@ def finalize_routes(routes, per, verdicts):
         # 把探测通过的排前面，欠费的垫底
         chain.sort(key=lambda c: 0 if c.get("probe") == "ok" else 1)
         routes["auto"] = {"candidates": chain}
+
+    # 跨模型兜底：某个模型的候选全挂了，就换别的家的别的模型顶上
+    # （例如 gpt-6-astra 全被限流时落到 NVIDIA 的 nemotron）
+    added = []
+    for slug, chain_spec in (FALLBACKS or {}).items():
+        r = routes.get(slug)
+        if not r:
+            continue
+        have = {(c["upstream"], c["model"]) for c in r["candidates"]}
+        for u, m in chain_spec:
+            if (u, m) in have or u not in per or m not in per.get(u, []):
+                continue
+            extra = {"upstream": u, "model": m, "probe": "ok", "fallback": True}
+            r["candidates"].append(extra)
+            have.add((u, m))
+            added.append((slug, u, m))
+    if added:
+        log("\n  跨模型兜底已加入：")
+        for slug, u, m in added:
+            log(f"    {slug} 失败后 → {u}/{m}")
     return routes
 
 
